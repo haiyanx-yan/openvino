@@ -127,6 +127,8 @@ protected:
     // Selects the generate variant for the given prompt length and rebinds the
     // request, its port maps and the variant index together.
     void bind_generate_variant(int64_t prompt_length);
+    void copy_encoder_hidden_states(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                                    const PortsMap& input_ports) const;
 
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;
@@ -147,6 +149,7 @@ protected:
     // This infer request is optional, so can be null.
     std::shared_ptr<ov::IAsyncInferRequest> m_lm_head_request;
     ov::SoPtr<ov::ITensor> m_logits;
+    ov::npuw::util::TensorPtr m_encoder_hidden_states;
 
     PortsMap m_prefill_in_ports;
     PortsMap m_prefill_out_ports;

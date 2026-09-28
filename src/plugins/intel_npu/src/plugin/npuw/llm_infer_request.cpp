@@ -653,8 +653,12 @@ void ov::npuw::LLMInferRequest::zero_prefill_staging() {
         type_ids_port != m_prefill_in_ports.end()) {
         uu::fill_tensor_bytes(m_prefill_request->get_tensor(type_ids_port->second), 0u);
     }
-    uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask)), 0);
-    uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids)), 0);
+    if (const auto port = m_prefill_in_ports.find(layer_names::attention_mask); port != m_prefill_in_ports.end()) {
+        uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(port->second), 0);
+    }
+    if (const auto port = m_prefill_in_ports.find(layer_names::position_ids); port != m_prefill_in_ports.end()) {
+        uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(port->second), 0);
+    }
 
     // Gemma4: Clear per_layer_inputs if present
     if (auto per_layer_port = m_prefill_in_ports.find(layer_names::per_layer_inputs);
@@ -672,6 +676,18 @@ void ov::npuw::LLMInferRequest::bind_generate_variant(int64_t prompt_length) {
     const auto& reqs = m_generate_requests;
     m_kvcache_variant_idx =
         static_cast<size_t>(std::distance(reqs.begin(), std::find(reqs.begin(), reqs.end(), m_kvcache_request)));
+}
+
+void ov::npuw::LLMInferRequest::copy_encoder_hidden_states(
+    const std::shared_ptr<ov::IAsyncInferRequest>& request,
+    const PortsMap& input_ports) const {
+    if (!m_encoder_hidden_states) {
+        return;
+    }
+
+    if (const auto port = input_ports.find("encoder_hidden_states"); port != input_ports.end()) {
+        m_encoder_hidden_states->copy_to(request->get_tensor(port->second)._ptr);
+    }
 }
 
 void ov::npuw::LLMInferRequest::prepare_for_new_conversation(int64_t prompt_length) {
@@ -1220,11 +1236,13 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
                     reinterpret_cast<uint8_t*>(padded_input->data()) + padded_input->get_byte_size() -
                         input_ids->get_byte_size());
 
-        auto padded_attention_mask = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
-        std::copy_n(
-            attention_mask->data<int64_t>(),
-            attention_mask->get_size(),
-            padded_attention_mask->data<int64_t>() + padded_attention_mask->get_size() - attention_mask->get_size());
+        if (const auto port = m_prefill_in_ports.find(layer_names::attention_mask); port != m_prefill_in_ports.end()) {
+            auto padded_attention_mask = m_prefill_request->get_tensor(port->second);
+            std::copy_n(attention_mask->data<int64_t>(),
+                        attention_mask->get_size(),
+                        padded_attention_mask->data<int64_t>() + padded_attention_mask->get_size() -
+                            attention_mask->get_size());
+        }
 
         if (token_type_ids) {
             auto padded_token_type_ids =
@@ -1234,8 +1252,9 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
             util::copy_to_right(token_type_ids, padded_token_type_ids);
         }
 
-        auto padded_position_ids = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
-        ov::npuw::util::pad_position_ids(padded_position_ids, position_ids);
+        if (const auto port = m_prefill_in_ports.find(layer_names::position_ids); port != m_prefill_in_ports.end()) {
+            ov::npuw::util::pad_position_ids(m_prefill_request->get_tensor(port->second), position_ids);
+        }
 
         if (const auto deepstack_it = m_prefill_in_ports.find(layer_names::deepstack_visual_embeds);
             deepstack_it != m_prefill_in_ports.end()) {
@@ -1295,6 +1314,7 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
             prepare_for_new_conversation(prompt_length);
         }
     });
+    copy_encoder_hidden_states(m_prefill_request, m_prefill_in_ports);
 
     // One regime decision for the whole logical prompt - chunked prefill reuses it, as
     // the in-graph Select did when it was fed from these same position_ids.
@@ -1463,6 +1483,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                            get_current_variant_capacity());
         }
     }
+    copy_encoder_hidden_states(m_kvcache_request, m_kvcache_in_ports);
 
     // Eagle3: Check for sampling result from external pipeline via VariableState
     if (m_eagle3_ext.is_eagle3_model() && m_generate_initialized) {
@@ -1484,10 +1505,14 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
             LOG_DEBUG("Prepare inputs.");
             namespace uu = ov::npuw::util;
             uu::fill_tensor_bytes(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(m_input_ids_name)), 0u);
-            uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::attention_mask)),
-                                     0);
-            uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids)),
-                                     0);
+            if (const auto port = m_kvcache_in_ports.find(layer_names::attention_mask);
+                port != m_kvcache_in_ports.end()) {
+                uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(port->second), 0);
+            }
+            if (const auto port = m_kvcache_in_ports.find(layer_names::position_ids);
+                port != m_kvcache_in_ports.end()) {
+                uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(port->second), 0);
+            }
 
             m_generate_initialized = true;
         }
@@ -1524,20 +1549,26 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         //       units of length of the current prompt on the right (for present
         //       kv layers) and the set of "1" units of number of previously calculated
         //       tokens on the left (for past kv layers).
-        auto kv_attn_mask = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::attention_mask));
-        std::copy_n(attention_mask->data<int64_t>(),
-                    attention_mask->get_size() - input_tokens_len,
-                    kv_attn_mask->data<int64_t>());
-        if (input_tokens_len < kvcache_desc.max_generation_token_len) {
-            std::fill_n(
-                kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - kvcache_desc.max_generation_token_len,
-                kvcache_desc.max_generation_token_len - input_tokens_len,
-                0);
+        if (const auto port = m_kvcache_in_ports.find(layer_names::attention_mask);
+            port != m_kvcache_in_ports.end()) {
+            auto kv_attn_mask = m_kvcache_request->get_tensor(port->second);
+            std::copy_n(attention_mask->data<int64_t>(),
+                        attention_mask->get_size() - input_tokens_len,
+                        kv_attn_mask->data<int64_t>());
+            if (input_tokens_len < kvcache_desc.max_generation_token_len) {
+                std::fill_n(
+                    kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - kvcache_desc.max_generation_token_len,
+                    kvcache_desc.max_generation_token_len - input_tokens_len,
+                    0);
+            }
+            std::fill_n(kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - input_tokens_len,
+                        input_tokens_len,
+                        1);
         }
-        std::fill_n(kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - input_tokens_len, input_tokens_len, 1);
 
-        auto kv_pos_ids = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids));
-        ov::npuw::util::pad_position_ids(kv_pos_ids, position_ids);
+        if (const auto port = m_kvcache_in_ports.find(layer_names::position_ids); port != m_kvcache_in_ports.end()) {
+            ov::npuw::util::pad_position_ids(m_kvcache_request->get_tensor(port->second), position_ids);
+        }
 
         if (m_eagle3_ext.is_eagle3_model()) {
             m_eagle3_ext.prepare_inputs(m_kvcache_request, m_kvcache_in_ports);
@@ -1598,7 +1629,19 @@ void ov::npuw::LLMInferRequest::infer() {
     const auto& inputs = get_inputs();
 
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());
-    auto attention_mask = get_tensor(ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask).value());
+    auto attention_mask = ov::npuw::util::TensorPtr();
+    if (auto attention_mask_port = ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask);
+        attention_mask_port.has_value()) {
+        attention_mask = get_tensor(attention_mask_port.value());
+    } else {
+        attention_mask = ov::make_tensor(ov::element::i64, input_ids->get_shape());
+        std::fill_n(attention_mask->data<int64_t>(), attention_mask->get_size(), 1);
+    }
+
+    m_encoder_hidden_states = ov::npuw::util::TensorPtr();
+    if (auto port = ov::npuw::util::find_port_by_name(inputs, "encoder_hidden_states"); port.has_value()) {
+        m_encoder_hidden_states = get_tensor(port.value());
+    }
 
     auto position_ids = ov::npuw::util::TensorPtr();
     auto position_ids_opt = ov::npuw::util::find_port_by_name(inputs, layer_names::position_ids);

@@ -3,6 +3,8 @@
 //
 #include "llm_compiled_model.hpp"
 
+#include <regex>
+
 #include "embedding/embedding_infer_request.hpp"
 #include "embedding/encoder_embedding_infer_request.hpp"
 #include "embedding/prepare_embedding_model.hpp"
@@ -64,6 +66,45 @@ T align_to(T value, T alignment) {
 template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
 bool is_aligned_to(T value, T alignment) {
     return value % alignment == 0;
+}
+
+void convert_initializer_backed_states_to_inputs(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& operation : model->get_ordered_ops()) {
+        const auto read_value = ov::as_type_ptr<ov::op::util::ReadValueBase>(operation);
+        if (!read_value || read_value->get_input_size() != 1) {
+            continue;
+        }
+
+        const auto parameter = ov::as_type_ptr<ov::op::v0::Parameter>(read_value->get_input_node_shared_ptr(0));
+        if (!parameter || parameter->get_output_tensor(0).get_names().count(read_value->get_variable_id()) == 0) {
+            continue;
+        }
+
+        const auto variable_id = read_value->get_variable_id();
+        for (const auto& sink : model->get_sinks()) {
+            const auto assign = ov::as_type_ptr<ov::op::util::AssignBase>(sink);
+            if (assign && assign->get_variable_id() == variable_id) {
+                model->remove_sink(assign);
+                break;
+            }
+        }
+
+        read_value->output(0).replace(parameter->output(0));
+        model->remove_variable(model->get_variable_by_id(variable_id));
+    }
+}
+
+void normalize_encoder_decoder_kv_state_names(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& variable : model->get_variables()) {
+        auto info = variable->get_info();
+        if (info.variable_id.find("past_key_values.") != 0 ||
+            info.variable_id.find(".decoder.") == std::string::npos) {
+            continue;
+        }
+
+        info.variable_id = std::regex_replace(info.variable_id, std::regex(R"(\.decoder\.)"), ".");
+        variable->update(info);
+    }
 }
 
 }  // namespace
@@ -819,7 +860,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     m_prefill_chunk_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
     m_use_chunk_prefill = (prefill_hint == ::intel_npu::npuw::llm::PrefillHint::DYNAMIC && m_prefill_chunk_size > 0);
 
-    uint32_t max_prompt_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
+    uint32_t max_prompt_len = m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>();
+    if (ov::npuw::util::has_input(model, "attention_mask")) {
+        max_prompt_len = align_to(max_prompt_len, 64u);
+    }
     const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
     uint32_t max_generation_token_len = m_cfg.get<::intel_npu::NPUW_LLM_MAX_GENERATION_TOKEN_LEN>();
     if (max_generation_token_len != 1) {
@@ -928,6 +972,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         ov::npuw::AddPositionIdsParam().run_on_model(kvcache_model);
         LOG_DEBUG("Right-align attention_mask slice for Conv operations: LFM-2 case.");
         ov::npuw::RightAlignMaskSliceForConv().run_on_model(kvcache_model);
+        convert_initializer_backed_states_to_inputs(kvcache_model);
+        normalize_encoder_decoder_kv_state_names(kvcache_model);
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
     }
